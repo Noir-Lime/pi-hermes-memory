@@ -82,6 +82,23 @@ function entryParser() {
         if (frames.length) frames[frames.length - 1].key = value.value();
         key = false;
         break;
+      case 'startNumber':
+        selected = valuePath();
+        if (selected !== '/id' && selected !== '/timestamp') selected = '';
+        value = new BoundedText(4096);
+        break;
+      case 'numberChunk':
+        if (selected) value.append(token.value ?? '');
+        break;
+      case 'endNumber': {
+        // JSON.parse accepted truthy numeric IDs/timestamps. Normalize those
+        // to the index's string fields, but keep numeric zero rejected. Never
+        // accumulate an unbounded numeric token or stringify truncated digits.
+        const number = selected && value.length <= 4096 ? Number(value.value()) : 0;
+        if (selected) fields[selected] = number ? String(number) : '';
+        selected = '';
+        break;
+      }
       case 'startString':
         selected = valuePath();
         if (!/^\/(type|id|cwd|timestamp|message\/role|message\/content|message\/content\/\*\/(type|text|name))$/.test(selected)) selected = '';

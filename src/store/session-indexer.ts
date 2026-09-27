@@ -804,7 +804,20 @@ export function pruneOldSessions(
       OR (sf.path IS NULL AND s.started_at < ?)
   `).all(cutoffMs, cutoffIso) as Array<{ id: string }>;
 
+  // Paths are authoritative here: session_files cascades with its session.
+  // Keep retained cursors (and their cheap appends), including when there is
+  // nothing to prune, while also cleaning orphans left by earlier versions.
+  const pruneOrphanCursors = () => db.prepare(`
+    DELETE FROM extension_metadata
+    WHERE key LIKE 'session-index-v1:%'
+      AND NOT EXISTS (
+        SELECT 1 FROM session_files sf
+        WHERE sf.path = substr(extension_metadata.key, length('session-index-v1:') + 1)
+      )
+  `).run();
+
   if (eligibleSessionIds.length === 0) {
+    pruneOrphanCursors();
     return { sessionsRemoved: 0, messagesRemoved: 0 };
   }
 
@@ -821,6 +834,7 @@ export function pruneOldSessions(
     const delSessions = db.prepare(
       `DELETE FROM sessions WHERE id IN (${eligibleSessionIds.map(() => '?').join(',')})`,
     ).run(...eligibleSessionIds.map((r) => r.id));
+    pruneOrphanCursors();
     return { messagesRemoved: delMessages.changes, sessionsRemoved: delSessions.changes };
   };
 
