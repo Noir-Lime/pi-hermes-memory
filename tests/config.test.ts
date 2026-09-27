@@ -16,6 +16,7 @@ describe("loadConfig", () => {
   it("returns defaults when no config file exists", () => {
     const config = loadConfig(TEST_CONFIG_PATH);
     assert.strictEqual(config.memoryMode, "policy-only");
+    assert.strictEqual(config.lazyInitialization, false);
     assert.strictEqual(config.memoryPolicyStyle, "full");
     assert.strictEqual(config.memoryPolicyCustomText, undefined);
     assert.strictEqual(config.memoryCharLimit, 5000);
@@ -28,6 +29,7 @@ describe("loadConfig", () => {
     assert.strictEqual(config.flushOnShutdown, true);
     assert.strictEqual(config.flushMinTurns, 6);
     assert.strictEqual(config.flushRecentMessages, 0);
+    assert.strictEqual(config.flushCompactTimeoutMs, 60000);
     assert.strictEqual(config.memoryOverflowStrategy, "auto-consolidate");
     assert.strictEqual(config.autoConsolidate, true);
     assert.strictEqual(config.consolidationTimeoutMs, 180000);
@@ -45,6 +47,22 @@ describe("loadConfig", () => {
     // deleted; a positive value opts in, 0/omitted disables.
     assert.strictEqual(config.sessionRetentionDays, 0);
     assert.strictEqual(config.quickCheckOnOpen, true);
+  });
+
+  it("honors consolidationChunkChars", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationChunkChars: 6000 }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunkChars, 6000);
+  });
+
+  it("ignores out-of-range consolidationChunkChars values", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationChunkChars: 100 }));
+    assert.strictEqual(
+      loadConfig(TEST_CONFIG_PATH).consolidationChunkChars,
+      4000,
+      "below the 500-char floor falls back to the default",
+    );
   });
 
   it("honors a configured consolidationTimeoutMs, warning only when it is below the default", () => {
@@ -70,6 +88,56 @@ describe("loadConfig", () => {
       console.warn = originalWarn;
     }
   });
+
+  it("honors a configured flushCompactTimeoutMs, warning only when it is below the default", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => { warnings.push(String(message)); };
+
+    try {
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ flushCompactTimeoutMs: 90000 }));
+      assert.strictEqual(loadConfig(TEST_CONFIG_PATH).flushCompactTimeoutMs, 90000);
+      assert.deepStrictEqual(warnings, [], "a value above the default should not warn");
+
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ flushCompactTimeoutMs: 30000 }));
+      assert.strictEqual(
+        loadConfig(TEST_CONFIG_PATH).flushCompactTimeoutMs,
+        30000,
+        "a lower configured value must be honored, not clamped",
+      );
+      assert.strictEqual(warnings.length, 1, "a sub-default value should warn once");
+      assert.match(warnings[0], /30000ms.*below the 60000ms default/);
+
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ flushCompactTimeoutMs: 0 }));
+      assert.strictEqual(
+        loadConfig(TEST_CONFIG_PATH).flushCompactTimeoutMs,
+        0,
+        "the disable sentinel must be honored",
+      );
+      assert.strictEqual(warnings.length, 1, "disabling the flush is not a too-low timeout");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it("ignores non-finite flushCompactTimeoutMs values and keeps the default", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => { warnings.push(String(message)); };
+
+    try {
+      // Written raw: JSON.stringify turns Infinity into null, so an object
+      // literal would test the string branch instead of the finite guard.
+      fs.writeFileSync(TEST_CONFIG_PATH, '{"flushCompactTimeoutMs": 1e999}');
+      assert.strictEqual(loadConfig(TEST_CONFIG_PATH).flushCompactTimeoutMs, 60000);
+      assert.deepStrictEqual(warnings, [], "a non-finite value is treated as absent, not warned");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
 
   it("overrides defaults when config file exists", () => {
     // Write a config file
@@ -110,6 +178,13 @@ describe("loadConfig", () => {
     // Unset values use defaults
     assert.strictEqual(config.userCharLimit, 5000);
     assert.strictEqual(config.reviewEnabled, true);
+  });
+
+  it("only accepts boolean lazyInitialization overrides", () => {
+    for (const value of [true, false, "true", 1, null]) {
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ lazyInitialization: value }));
+      assert.strictEqual(loadConfig(TEST_CONFIG_PATH).lazyInitialization, value === true);
+    }
   });
 
   it("only accepts boolean quickCheckOnOpen overrides", () => {

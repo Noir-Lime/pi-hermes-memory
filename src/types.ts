@@ -18,6 +18,8 @@ export interface SessionSearchConfig {
 }
 
 export interface MemoryConfig {
+  /** Defer policy-only memory initialization until first use. Default: false */
+  lazyInitialization?: boolean;
   /** Prompt memory mode. Default: policy-only */
   memoryMode: "policy-only" | "legacy-inject";
   /** Policy prompt style used when memoryMode is policy-only. Default: full */
@@ -46,6 +48,9 @@ export interface MemoryConfig {
   flushMinTurns: number;
   /** Recent conversation messages included in session flush. 0 = all. Default: 0 */
   flushRecentMessages?: number;
+  /** Ceiling for the compact-path flush (direct + subprocess). Default: 60000 */
+  flushCompactTimeoutMs?: number;
+
   /** Override extension storage directory. Default: ~/.pi/agent/pi-hermes-memory */
   memoryDir?: string;
   /** Directory for project-scoped memory (relative to ~/.pi/agent). Default: "projects-memory" */
@@ -88,6 +93,23 @@ export interface MemoryConfig {
   nudgeToolCalls: number;
   /** Maximum time in milliseconds for a consolidation run, auto or manual. Default: 180000 */
   consolidationTimeoutMs: number;
+  /**
+   * Master switch for chunked subprocess consolidation. When false (the
+   * default), the subprocess path keeps the legacy single-shot behavior for
+   * stores of any size. When true, entries joined above
+   * `consolidationChunkChars` split the work into multiple child runs that
+   * share one overall time budget (consolidationTimeoutMs); the loop stops at
+   * the target's capacity goal. Has no effect on the direct (in-process)
+   * transport.
+   */
+  /**
+   * Enables chunked subprocess consolidation (bounded rounds with a shared
+   * time budget). Default: false — the legacy single-shot behavior applies
+   * until explicitly enabled. Provisional pending reproduction of the
+   * original timeout on a faster model.
+   */
+  consolidationChunking?: boolean;
+  consolidationChunkChars?: number;
   /** Log failed auto-consolidation attempts to the session console. Default: true */
   autoConsolidationWarnOnFailure: boolean;
   /** Inject pinned STANDING.md instructions into every session. Default: true */
@@ -145,6 +167,18 @@ export interface ConsolidationResult {
   consolidated: boolean;
   /** Error message if consolidation failed */
   error?: string;
+  /**
+   * True when at least one round completed but the run ended with a failure
+   * or the store is still over its capacity goal. Progress is real and on
+   * disk; retriggering continues from current state. Consumers should
+   * surface `error` alongside the success path when this is set.
+   */
+  partial?: boolean;
+  /**
+   * Number of subprocess consolidation rounds that completed successfully
+   * (chunked path only; absent for single-shot runs).
+   */
+  rounds?: number;
   /**
    * Set when another session already holds the consolidation lock for this
    * target. Nothing is broken — the work is happening elsewhere — so callers

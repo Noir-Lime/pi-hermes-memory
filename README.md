@@ -122,6 +122,32 @@ Or test locally without installing:
 pi -e /path/to/pi-hermes-memory/src/index.ts
 ```
 
+### DeepSeek Harness
+
+Use persistent memory in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+through [pi2dsh](https://github.com/weijiafu14/pi2dsh):
+
+```bash
+dsh plugin --profile web add -w pi2dsh pi-hermes-memory
+dsh web
+```
+
+If pnpm requests build approval, run `dsh plugin --profile web approve-builds`,
+approve `better-sqlite3` and `esbuild` when listed, then restart `dsh web`.
+
+In one conversation, ask:
+
+> Use memory_add to remember that my project codename is ZEPHYR-7741.
+
+Start a **new session** and ask:
+
+> Use memory_search to recall my project codename.
+
+Use `memory_replace` to update a saved fact and `memory_remove` to delete it.
+The package manages its own memory files and SQLite store under
+`$DSH_HOME/pi2dsh/agent/` (with the default DSH home when `DSH_HOME` is unset).
+For the headless CLI, install into `--profile headless` instead of `web`.
+
 ### Homebrew / Node ABI mismatches
 
 `better-sqlite3` is a native addon. If Pi is installed via Homebrew and the extension was compiled for a different Node ABI, session search may warn:
@@ -274,6 +300,8 @@ For `create` and `update`, the preferred shape is structured input instead of ha
 
 The tool renders these into a valid `SKILL.md` body with `## When to Use`, `## Procedure`, `## Pitfalls`, and `## Verification` automatically. Raw `content` is still supported for compatibility, but structured fields are the recommended path.
 
+Pi discovers skills by the frontmatter `description` alone — `when_to_use` and the other structured fields render into the body, which Pi reads only after the skill has been selected. Put the trigger phrasings a user would actually type (symptoms, error strings, tool names) in `description`.
+
 Global skill creation also has duplicate/similarity guards:
 
 - exact slug match → blocked (update existing via `patch`/`update`)
@@ -285,13 +313,13 @@ Each skill uses a structured `SKILL.md` body:
 ```markdown
 ---
 name: debug-typescript-errors
-description: Step-by-step approach to debugging TS errors in monorepos
+description: Debug TypeScript errors in a monorepo — tsc --noEmit failures, type-check errors in CI, tsconfig extends-chain breakage
 version: 1
 created: 2026-04-26
 updated: 2026-04-26
 ---
 ## When to Use
-When you see TypeScript compilation errors, especially in monorepo setups.
+TypeScript compilation errors in this workspace, especially monorepo setups. Not for runtime-only type issues.
 
 ## Procedure
 1. Read the error message carefully
@@ -487,6 +515,7 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 
 ```json
 {
+  "lazyInitialization": false,
   "memoryMode": "policy-only",
   "memoryPolicyStyle": "full",
   "memoryCharLimit": 5000,
@@ -512,9 +541,12 @@ Create `~/.pi/agent/hermes-memory-config.json`:
   "failureInjectionMaxAgeDays": 7,
   "failureInjectionMaxEntries": 5,
   "consolidationTimeoutMs": 180000,
+  "consolidationChunking": false,
+  "consolidationChunkChars": 4000,
   "overflowGraceMs": 180000,
   "autoConsolidationWarnOnFailure": true,
   "flushOnCompact": true,
+  "flushCompactTimeoutMs": 60000,
   "flushOnShutdown": true,
   "flushMinTurns": 6,
   "flushRecentMessages": 0,
@@ -524,6 +556,7 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 
 | Setting | Default | Description |
 |---|---|---|
+| `lazyInitialization` | `false` | Opt in to first-use initialization in `policy-only` mode. Defers Markdown/SQLite sync, ordinary memory loading, maintenance and session indexing until a memory operation needs them. `legacy-inject` keeps eager loading to preserve session snapshots. See below for lifecycle tradeoffs. |
 | `memoryMode` | `policy-only` | Prompt behavior: `policy-only` injects only memory policy; `legacy-inject` restores full memory prompt injection |
 | `memoryPolicyStyle` | `full` | Policy text used in `policy-only` mode: `full` preserves the default v0.7 policy; `compact` uses shorter built-in guidance; `custom` uses `memoryPolicyCustomText`; `none` injects no policy text |
 | `memoryPolicyCustomText` | unset | Custom policy text used when `memoryPolicyStyle` is `custom`; blank or missing text falls back to `compact` |
@@ -546,7 +579,9 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 | `reviewTransport` | `direct` | LLM transport for background review, session flush, correction save, and manual consolidation: `direct` uses in-process `completeSimple()` with subprocess fallback; `subprocess` forces legacy `pi -p` only |
 | `memoryOverflowStrategy` | `auto-consolidate` | Legacy-inject behavior when a Markdown memory file reaches its character limit: `auto-consolidate` runs the existing consolidation flow; `reject` returns an error; `fifo-evict` rotates older entries in file order until the new entry fits |
 | `autoConsolidate` | `true` | Legacy alias for `memoryOverflowStrategy` when `memoryOverflowStrategy` is not set (`true` = `auto-consolidate`, `false` = `reject`) |
-| `consolidationTimeoutMs` | `180000` | Maximum time in milliseconds for a consolidation run (auto and `/memory-consolidate` alike). Configured values are used verbatim; a consolidation pays child-process boot plus a full LLM turn, so values below the default are frequently killed mid-run and log a warning at startup |
+| `consolidationTimeoutMs` | `180000` | Maximum time in milliseconds for a consolidation run (auto and `/memory-consolidate` alike). Also bounds the TOTAL time of a chunked consolidation trigger, so a trigger never blocks longer than the single call it replaced. Configured values are used verbatim; a consolidation pays child-process boot plus a full LLM turn, so values below the default are frequently killed mid-run and log a warning at startup |
+| `consolidationChunking` | `false` | Enables chunked subprocess consolidation: stores whose entries exceed `consolidationChunkChars` are consolidated in bounded rounds with per-round timeouts and resume-from-disk, instead of one whole-store child call. Off by default — enable it if whole-store consolidations time out on your model. Has no effect on the direct in-process transport |
+| `consolidationChunkChars` | `4000` | Applies when `consolidationChunking` is enabled: entries above this many chars (joined) split the subprocess work into multiple child runs that share the `consolidationTimeoutMs` budget, reloading from disk between rounds. The loop stops at the target's capacity goal; a store that fits one prompt runs a single unscoped decisive round. Minimum 500 | When the entries to consolidate exceed this many chars, the subprocess path splits consolidation into multiple child runs (rounds) that share the `consolidationTimeoutMs` budget, reloading from disk between rounds so a killed run resumes from partial progress. The loop stops at the target's capacity goal (not the chunk size). A store that fits one prompt runs a single unscoped decisive round with the whole remaining store. Stores at or below the threshold keep the single-shot call shape — the only difference is that a child exiting 0 without shrinking now reports an honest partial result instead of silent success. Has no effect on the direct in-process transport. Minimum 500 |
 | `overflowGraceMs` | `180000` | Wall-clock grace period after a memory overflow before automatic consolidation is retried; this gives the active agent time to consolidate manually. Set to `0` to disable the grace period |
 | `autoConsolidationWarnOnFailure` | `true` | Log failed automatic consolidation attempts to the session console. Set to `false` to suppress only this warning; the memory tool result still reports the failure reason |
 | `correctionDetection` | `true` | Detect user corrections and save immediately |
@@ -558,9 +593,55 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 | `failureInjectionMaxAgeDays` | `7` | Legacy mode only: maximum age in days for injected failure memories |
 | `failureInjectionMaxEntries` | `5` | Legacy mode only: maximum number of failure memories to inject |
 | `flushOnCompact` | `true` | Flush memories before Pi compacts context |
+| `flushCompactTimeoutMs` | `60000` | Approximate ceiling in milliseconds for the pre-compaction flush (direct + optional subprocess). Both transports share this one window; the subprocess fallback gets only the remainder, never a second full window. The child's watchdog teardown can add ~5s past the window. Configured values are used verbatim; values below the default warn at startup the same way `consolidationTimeoutMs` does, while `0` or lower silently disables the compact flush. Raise this for slow/local models; lower it if you would rather compact fast than wait for a save |
 | `flushOnShutdown` | `true` | Flush memories when session ends |
 | `flushMinTurns` | `6` | Minimum turns before flush triggers |
 | `flushRecentMessages` | `0` | Recent messages included in session flush (`0` = all) |
+
+### Optional Lazy Initialization
+
+For installations on slow or shared storage, enable:
+
+```json
+{
+  "memoryMode": "policy-only",
+  "lazyInitialization": true
+}
+```
+
+With this option, opening Pi or sending an ordinary prompt does not initialize
+the memory database or read the ordinary memory stores. Tools and commands are
+still registered immediately. The first memory search, write, or data-dependent
+memory command waits for migration, synchronization and loading. Concurrent
+callers share the load; a failed load can be retried by the next operation.
+
+Important boundaries:
+
+- Pinned `STANDING.md` instructions and skill discovery remain available at
+  startup. Pins in a legacy storage root are read independently of migration or
+  SQLite; the primary file, even if empty, takes precedence. `/memory-pin` writes
+  to the primary path without dropping the legacy instructions it loaded.
+- `legacy-inject` ignores the lazy option and preserves its startup snapshot.
+- Automatic review, correction capture and flush retain their existing triggers;
+  when a trigger fires, it initializes memory before reading or writing it.
+  Lazy initialization does not disable automatic learning or its model costs.
+- Session indexing starts after memory activation. Until then, Pi's original
+  JSONL session files remain the source of history. First use joins the scheduled
+  catch-up pass to completion (at most 50 changed files), without using the
+  five-second shutdown timeout. Use `/memory-index-sessions` for a larger backlog.
+  Anchor-mode session search
+  reads JSONL directly and does not activate the memory database.
+- Closing an unused session does not initialize memory just to index it. A
+  configured flush that meets its minimum-turn threshold can still activate it.
+  Shutdown joins in-flight preparation and memory tool/command execution before
+  closing SQLite. Escape cancels a tool's wait without cancelling shared work.
+- Project listing, prompt preview and anchor search do not activate SQLite.
+- This defers data initialization, not extension SDK imports. The direct
+  completion SDK remains a static import so Pi's jiti aliases also work in
+  production installs without package-local SDK peers. First use pays the
+  deferred data-loading cost; this is not a guarantee of faster searches.
+
+The default remains `false`, so existing installations keep eager initialization.
 
 ## Diagnosing lifecycle latency
 
@@ -573,12 +654,33 @@ PI_TIMING=1 pi
 `pi-hermes-memory` writes these spans to stderr only when timing is enabled:
 
 - `session-start.persistence-sync` and `session-start.load`
+- `memory-init.persistence-sync` and `memory-init.load` instead, when lazy initialization is enabled
 - `session-backfill.check` and `session-backfill.callback`
 - `live-index.callback`
 - `shutdown.flush`, `shutdown.active-index`, `shutdown.index-waits`, and `shutdown.database-close`
 - `database.open`, `database.quick-check`, and `database.checkpoint`
 
 The deferred backfill, live-index, and integrity-check spans may appear after startup spans because they run on later timer turns. `/reload` does not run `shutdown.flush`; other shutdown reasons keep the configured direct completion and subprocess fallback. Use the measured spans before changing indexing, checkpoint, or synchronization policy.
+
+From a development checkout, compare eager and lazy extension initialization
+without model calls or access to your real memory:
+
+```bash
+node --import tsx scripts/benchmark-memory-startup.mjs
+node --import tsx scripts/benchmark-memory-startup.mjs --lazy
+```
+
+The benchmark uses a disposable agent root with synthetic memories for 20
+projects. It reports import, registration, session startup and first-search
+times separately; it does not measure the full Pi TUI. Run variants sequentially
+and repeat to account for filesystem cache effects. Set `TMPDIR` to a directory
+on shared storage to measure that storage's data initialization cost.
+
+`npm run check:production` packs the checkout, installs it in a temporary directory
+without dev/peer dependencies, and loads it through Pi's real jiti loader. It
+exercises the direct-completion path against a loopback HTTP fixture, not a paid
+model or real memory. npm access is required to install production dependencies;
+native install scripts are disabled because the fixture writes no memories.
 
 ## Where Data Lives
 
