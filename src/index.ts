@@ -400,19 +400,26 @@ export default function (pi: ExtensionAPI) {
       dbManager.close();
       return;
     }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      await measureLifecycle("shutdown.active-index", () => indexLiveSessionAsync(dbManager, ctx.sessionManager));
-    } catch {
-      // Silent fail — don't block shutdown
-    } finally {
-      try {
-        await measureLifecycle("shutdown.index-waits", () => Promise.all([
+      // Include time spent behind bulk indexing in the same shutdown budget.
+      // Observe every rejection even if the deadline wins the race.
+      await measureLifecycle("shutdown.index-waits", () => Promise.race([
+        Promise.allSettled([
+          measureLifecycle("shutdown.active-index", () => indexLiveSessionAsync(dbManager, ctx.sessionManager)),
           waitForSessionBackfill(SESSION_BACKFILL_SHUTDOWN_TIMEOUT_MS, backfillState),
           waitForLiveSessionIndex(SESSION_LIVE_INDEX_SHUTDOWN_TIMEOUT_MS),
-        ]));
-      } catch {
-        // Best effort only — shutdown should not be held up by indexing errors.
-      }
+        ]),
+        new Promise<void>((resolve) => {
+          timeout = setTimeout(resolve, SESSION_LIVE_INDEX_SHUTDOWN_TIMEOUT_MS);
+        }),
+      ]));
+    } catch {
+      // Best effort only — shutdown should not be held up by indexing errors.
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      // The open guard prevents timed-out queued work from reopening SQLite or
+      // advancing a checkpoint after close. Completed scans keep their cursor.
       try {
         databaseClosed = true;
         measureLifecycleSync("shutdown.database-close", () => dbManager.close());

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseManager } from '../../src/store/db.js';
-import { indexLiveSessionAsync } from '../../src/store/session-indexer.js';
+import { indexLiveSessionAsync, pruneOldSessions } from '../../src/store/session-indexer.js';
 import { parseSessionFile } from '../../src/store/session-parser.js';
 import { DEFAULT_MAX_MESSAGE_CONTENT_LENGTH } from '../../src/constants.js';
 
@@ -52,6 +52,7 @@ test('appended messages use a bounded checkpoint read, not a whole-history resca
   const { file, db, manager } = fixture(t);
   fs.appendFileSync(file, JSON.stringify(message('first', 'x'.repeat(2 * 1024 * 1024))) + '\n');
   await indexLiveSessionAsync(db, manager);
+  pruneOldSessions(db, 30);
   fs.appendFileSync(file, JSON.stringify(message('second', 'new text')) + '\n');
   let bytes = 0;
   const read = fs.readSync;
@@ -91,6 +92,63 @@ test('detects truncation and replacement and rebuilds searchable rows', async t 
   await indexLiveSessionAsync(db, manager);
   assert.equal(db.getStats().messages, 1);
   assert.ok(db.getDb().prepare('SELECT id FROM messages WHERE id = ?').get('replaced'));
+});
+
+for (const field of ['header-id', 'header-timestamp', 'message-id', 'message-timestamp', 'all']) {
+  test(`accepts numeric ${field} and normalizes index fields to strings`, async t => {
+    const { file, db, manager } = fixture(t);
+    const numeric = (name: string) => field === name || field === 'all';
+    const session = { ...header, id: numeric('header-id') ? 42 : header.id, timestamp: numeric('header-timestamp') ? 1700000000000 : header.timestamp };
+    const entry = { ...message('numeric', 'numeric searchable text'), id: numeric('message-id') ? 43 : 'numeric', timestamp: numeric('message-timestamp') ? 1700000000001 : header.timestamp };
+    fs.writeFileSync(file, [session, entry].map(v => JSON.stringify(v)).join('\n') + '\n');
+    const parsed = parseSessionFile(file)!;
+    assert.equal(parsed.id, String(session.id));
+    assert.equal(parsed.startedAt, String(session.timestamp));
+    assert.equal(parsed.messages[0].id, String(entry.id));
+    assert.equal(parsed.messages[0].timestamp, String(entry.timestamp));
+    assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed, 1);
+    const row = db.getDb().prepare('SELECT id, timestamp FROM messages').get();
+    assert.deepEqual(row, { id: String(entry.id), timestamp: String(entry.timestamp) });
+    assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed, 0);
+  });
+}
+
+test('normalizes negative and exponent numbers with JSON numeric semantics', async t => {
+  const { file, db, manager } = fixture(t);
+  fs.appendFileSync(file, '{"type":"message","id":-4.2e1,"timestamp":1.7e12,"message":{"role":"user","content":"exponent text"}}\n');
+  const parsed = parseSessionFile(file)!;
+  assert.equal(parsed.messages[0].id, '-42');
+  assert.equal(parsed.messages[0].timestamp, '1700000000000');
+  assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed, 1);
+});
+
+for (const field of ['header-id', 'header-timestamp', 'message-id', 'message-timestamp']) {
+  for (const zero of [0, -0, '0']) {
+    test(`${field} preserves truthiness of ${typeof zero} ${Object.is(zero, -0) ? '-0' : zero}`, async t => {
+      const { file, db, manager } = fixture(t);
+      const session = { ...header, ...(field === 'header-id' ? { id: zero } : field === 'header-timestamp' ? { timestamp: zero } : {}) };
+      const entry = { ...message('zero', 'zero text'), ...(field === 'message-id' ? { id: zero } : field === 'message-timestamp' ? { timestamp: zero } : {}) };
+      // JSON.stringify converts -0 to 0; retain its spelling for the tokenizer.
+      fs.writeFileSync(file, [session, entry].map(v => JSON.stringify(v)).join('\n').replace(/:0([,}])/g, Object.is(zero, -0) ? ':-0$1' : ':0$1') + '\n');
+      const parsed = parseSessionFile(file);
+      if (typeof zero === 'string') assert.equal(parsed?.messages.length, 1);
+      else if (field.startsWith('header')) assert.equal(parsed, null);
+      else assert.equal(parsed?.messages.length, 0);
+      assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed ?? 0, typeof zero === 'string' ? 1 : 0);
+    });
+  }
+}
+
+test('does not interpret numeric content or a nested timestamp as searchable fields', async t => {
+  const { file, db, manager } = fixture(t);
+  fs.appendFileSync(file, [
+    message('number-content', 123),
+    message('number-text', [{ type: 'text', text: 456 }]),
+    { type: 'message', id: 'nested-time', message: { role: 'user', content: 'ignored', timestamp: 1700000000000 } },
+    message('valid', 'still searchable'),
+  ].map(v => JSON.stringify(v)).join('\n') + '\n');
+  assert.deepEqual(parseSessionFile(file)!.messages.map(m => m.id), ['valid']);
+  assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed, 1);
 });
 
 test('reindexes after indexed rows were pruned instead of trusting an orphan cursor', async t => {
