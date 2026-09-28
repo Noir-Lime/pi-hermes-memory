@@ -64,8 +64,112 @@ test('appended messages use a bounded checkpoint read, not a whole-history resca
   }) as typeof fs.readSync;
   try { assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed, 1); }
   finally { fs.readSync = read; }
-  assert.ok(bytes < 32 * 1024, `read ${bytes} bytes for a small append`);
+  assert.ok(bytes < 64 * 1024, `read ${bytes} bytes for a small append`);
   assert.equal(db.getStats().messages, 2);
+});
+
+for (const mode of ['initial', 'resumed', 'partial-tail']) {
+  test(`preserves committed progress when a file grows during a real async ${mode} scan`, async t => {
+    const { file, db, manager } = fixture(t);
+    if (mode === 'resumed') await indexLiveSessionAsync(db, manager);
+    fs.appendFileSync(file, JSON.stringify(message('large', 'x'.repeat(8 * 1024 * 1024))) + '\n');
+    const committed = fs.statSync(file).size;
+    const tail = JSON.stringify(message('tail', 'appended while scanning')) + '\n';
+    const partial = mode === 'partial-tail' ? tail.slice(0, -10) : '';
+    fs.appendFileSync(file, partial);
+    const read = fs.readSync;
+    let scheduled = false;
+    let appended = false;
+    const spy = t.mock.method(fs, 'readSync', (...args: Parameters<typeof fs.readSync>) => {
+      const n = (read as Function)(...args) as number;
+      if (!scheduled && n === 64 * 1024) {
+        scheduled = true;
+        // Runs only when the actual async scanner yields, not before it starts.
+        setImmediate(() => {
+          fs.appendFileSync(file, tail.slice(partial.length));
+          appended = true;
+        });
+      }
+      return n;
+    });
+    assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed, 1);
+    spy.mock.restore();
+    assert.ok(appended, 'append must occur during the asynchronous scan');
+    const row = db.getDb().prepare('SELECT value FROM extension_metadata WHERE key = ?').get(`session-index-v1:${file}`) as { value: string };
+    assert.equal(JSON.parse(row.value).offset, committed);
+    assert.equal(JSON.parse(row.value).size, committed);
+    const metadata = db.getDb().prepare('SELECT size FROM session_files WHERE path = ?').get(file) as { size: number };
+    assert.equal(metadata.size, committed);
+    let bytes = 0;
+    const resumeSpy = t.mock.method(fs, 'readSync', (...args: Parameters<typeof fs.readSync>) => {
+      const n = (read as Function)(...args) as number;
+      bytes += n;
+      return n;
+    });
+    assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed, 1);
+    resumeSpy.mock.restore();
+    assert.ok(bytes < 64 * 1024, `resume read ${bytes} bytes instead of just samples and tail`);
+    assert.equal(db.getStats().messages, 2);
+    assert.equal((await indexLiveSessionAsync(db, manager))?.messagesIndexed, 0);
+  });
+}
+
+test('rejects an in-place rewrite plus append during the async scan despite unchanged inode', async t => {
+  const { file, db, manager } = fixture(t);
+  for (let i = 0; i < 64; i++) fs.appendFileSync(file, JSON.stringify(message(`old-${i}`, 'old content')) + '\n');
+  await indexLiveSessionAsync(db, manager);
+  fs.appendFileSync(file, JSON.stringify(message('large', 'x'.repeat(8 * 1024 * 1024))) + '\n');
+  const ino = fs.statSync(file).ino;
+  const read = fs.readSync;
+  let scheduled = false;
+  let rewritten = false;
+  const spy = t.mock.method(fs, 'readSync', (...args: Parameters<typeof fs.readSync>) => {
+    const n = (read as Function)(...args) as number;
+    if (!scheduled && n === 64 * 1024) {
+      scheduled = true;
+      setImmediate(() => {
+        const position = Buffer.byteLength(JSON.stringify(header) + '\n') + JSON.stringify(message('old-0', 'old content')).indexOf('old content');
+        const fd = fs.openSync(file, 'r+');
+        try { fs.writeSync(fd, Buffer.from('new content'), 0, 11, position); }
+        finally { fs.closeSync(fd); }
+        fs.appendFileSync(file, JSON.stringify(message('tail', 'new tail')) + '\n');
+        rewritten = true;
+      });
+    }
+    return n;
+  });
+  assert.equal(await indexLiveSessionAsync(db, manager), null);
+  spy.mock.restore();
+  assert.ok(rewritten);
+  assert.equal(fs.statSync(file).ino, ino);
+  assert.equal(db.getDb().prepare('SELECT value FROM extension_metadata WHERE key = ?').get(`session-index-v1:${file}`), undefined);
+  assert.equal(db.getDb().prepare('SELECT path FROM session_files WHERE path = ?').get(file), undefined);
+  assert.equal(db.getStats().messages, 0, 'discard committed stale rows along with the cursor');
+  await indexLiveSessionAsync(db, manager);
+  assert.equal((db.getDb().prepare('SELECT content FROM messages WHERE id = ?').get('old-0') as { content: string }).content, 'new content');
+  assert.equal(db.getStats().messages, 66);
+});
+
+test('midpoint fingerprint detects an edit with unchanged head, boundary, size, inode and mtime', async t => {
+  const { file, db, manager } = fixture(t);
+  fs.appendFileSync(file, JSON.stringify(message('middle', 'x'.repeat(32 * 1024))) + '\n');
+  fs.utimesSync(file, 1700000000, 1700000000);
+  await indexLiveSessionAsync(db, manager);
+  const before = fs.statSync(file);
+  const original = fs.readFileSync(file);
+  const changed = Buffer.from(original);
+  changed[Math.floor(changed.length / 2)] = 'y'.charCodeAt(0);
+  fs.writeFileSync(file, changed);
+  fs.utimesSync(file, before.atime, before.mtime);
+  const after = fs.statSync(file);
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.size, before.size);
+  assert.equal(after.mtimeMs, before.mtimeMs);
+  assert.deepEqual(changed.subarray(0, 4096), original.subarray(0, 4096));
+  assert.deepEqual(changed.subarray(-4096), original.subarray(-4096));
+  await indexLiveSessionAsync(db, manager);
+  const content = (db.getDb().prepare('SELECT content FROM messages WHERE id = ?').get('middle') as { content: string }).content;
+  assert.ok(content.includes('y'), 'middle edit must invalidate the checkpoint and replace the old row');
 });
 
 test('retries a partially written trailing record and skips malformed completed lines', async t => {

@@ -299,7 +299,8 @@ function fingerprint(file: string, offset: number): string {
   try {
     const hash = createHash('sha256');
     const buffer = Buffer.alloc(Math.min(4096, offset));
-    for (const position of [0, Math.max(0, offset - buffer.length)]) {
+    // Bounded samples, not a full-prefix integrity guarantee.
+    for (const position of [0, Math.max(0, Math.floor(offset / 2) - Math.floor(buffer.length / 2)), Math.max(0, offset - buffer.length)]) {
       const size = fs.readSync(fd, buffer, 0, buffer.length, position);
       hash.update(buffer.subarray(0, size));
     }
@@ -321,6 +322,9 @@ function* indexFileSteps(dbManager: DatabaseManager, file: string): Generator<vo
     && (cursor.size < stat.size || cursor.mtimeMs === stat.mtimeMs)
     && cursor.header?.id && db.prepare('SELECT id FROM sessions WHERE id = ?').get(cursor.header.id)
     && cursor.fingerprint === fingerprint(file, cursor.offset);
+  // Compare the same fixed extent before/after scanning: inode identity alone
+  // does not distinguish appends from in-place rewrites.
+  const beforeFingerprint = fingerprint(file, stat.size);
   let session: ParsedSession | null = valid ? { ...cursor!.header, messages: [] } : null;
   let offset = valid ? cursor!.offset : 0;
   let result: IndexResult | null = null;
@@ -335,7 +339,7 @@ function* indexFileSteps(dbManager: DatabaseManager, file: string): Generator<vo
     session.messages = [];
     batchSize = 0;
   };
-  for (const record of readSessionRecords(file, offset)) {
+  for (const record of readSessionRecords(file, offset, stat.size)) {
     if (!record) { yield; continue; }
     if (record.offset >= 0) offset = record.offset;
     const entry = record.entry;
@@ -359,13 +363,29 @@ function* indexFileSteps(dbManager: DatabaseManager, file: string): Generator<vo
   if (result) (result as IndexResult).messagesIndexed = Math.max(0, (result as IndexResult).messagesIndexed - replacedMessages);
   if (session) {
     const after = fs.statSync(file);
-    // Do not mark bytes appended during a scan, or a replaced file, as indexed.
-    if (after.ino === stat.ino && after.dev === stat.dev && after.size === stat.size && after.mtimeMs === stat.mtimeMs) {
+    // Growth is allowed only when the original extent's samples still match.
+    // Never mark the appended tail (or an incomplete record) as indexed.
+    if (after.ino === stat.ino && after.dev === stat.dev && after.size >= stat.size
+      && (after.size > stat.size || after.mtimeMs === stat.mtimeMs)
+      && beforeFingerprint === fingerprint(file, stat.size)) {
       const { messages: _messages, ...header } = session;
-      const next: IndexCursor = { version: 1, offset, size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino, dev: stat.dev, fingerprint: fingerprint(file, offset), header };
+      const next: IndexCursor = { version: 1, offset, size: offset, mtimeMs: after.mtimeMs, ino: stat.ino, dev: stat.dev, fingerprint: fingerprint(file, offset), header };
       dbManager.getDb().prepare('INSERT INTO extension_metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, JSON.stringify(next));
       // A partial final record must remain eligible for the next backfill.
-      upsertSessionFileMetadata(dbManager, file, session.id, { path: file, size: offset, mtimeMs: Math.trunc(stat.mtimeMs) });
+      upsertSessionFileMetadata(dbManager, file, session.id, { path: file, size: offset, mtimeMs: Math.trunc(after.mtimeMs) });
+    } else {
+      // Batches may already contain pre-rewrite rows. Drop derived state so
+      // INSERT OR IGNORE cannot preserve stale content on the next full pass.
+      dbManager.getDb(); // Preserve the closed-DB guard before cleanup.
+      const discard = () => {
+        db.prepare('DELETE FROM messages WHERE session_id = ?').run(session!.id);
+        db.prepare('UPDATE sessions SET message_count = 0 WHERE id = ?').run(session!.id);
+        db.prepare('DELETE FROM extension_metadata WHERE key = ?').run(key);
+        db.prepare('DELETE FROM session_files WHERE path = ?').run(file);
+      };
+      if (db.transaction) db.transaction(discard)();
+      else discard();
+      return null;
     }
   }
   return result;

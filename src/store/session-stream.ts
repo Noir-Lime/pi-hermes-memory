@@ -138,13 +138,13 @@ export interface SessionRecord {
 
 /** Progress yields let asynchronous callers relinquish the event loop even
  * inside a multi-gigabyte line. Memory does not depend on the file/line size. */
-export function* readSessionRecords(filePath: string, start = 0): Generator<SessionRecord | undefined> {
+export function* readSessionRecords(filePath: string, start = 0, endOffset?: number): Generator<SessionRecord | undefined> {
   const fd = fs.openSync(filePath, 'r');
   const buffer = Buffer.allocUnsafe(64 * 1024);
   let position = start;
   let record = entryParser();
   try {
-    const end = fs.fstatSync(fd).size;
+    const end = Math.min(endOffset ?? Infinity, fs.fstatSync(fd).size);
     while (position < end) {
       const size = fs.readSync(fd, buffer, 0, Math.min(buffer.length, end - position), position);
       if (!size) break;
